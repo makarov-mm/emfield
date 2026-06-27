@@ -11,7 +11,8 @@ on the CPU with RK4 and coloured by local field strength.
 
 > Press **P** at any time to save a 1920×1080 PNG of the current frame.
 
----
+## Screenshot
+![Screenshot](screenshot.png)  
 
 ## Scenarios
 
