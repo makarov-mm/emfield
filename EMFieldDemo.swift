@@ -1,41 +1,36 @@
 // =============================================================================
-//  EMFieldDemo.swift
-//  Charged particle in an electromagnetic field + field-line tracing.
+//  EMFieldDemo.swift  —  GPU particle-swarm edition
 //
-//  Scenarios:
+//  A swarm of hundreds of thousands of charged test particles pushed through
+//  electromagnetic fields on the GPU (Boris pusher in a compute kernel),
+//  rendered as additive HDR point sprites coloured by speed, with a
+//  feedback-accumulation buffer (light-painted trails) and a bloom post pass.
+//
+//  Scenarios (unchanged physics):
 //      1  Magnetic dipole      (radiation-belt-like trapping)
 //      2  Magnetic quadrupole  (focusing / hyperbolic field lines)
 //      3  Cyclotron            (uniform B -> helical gyration)
 //      4  Magnetic bottle      (magnetic mirror -> bouncing motion)
-//      5  Electric dipole      (Coulomb E-field lines, accelerated test charge)
-//      6  Electric quadrupole  (4 point charges, deflection trajectory)
+//      5  Electric dipole      (Coulomb E-field, accelerated test charges)
+//      6  Electric quadrupole  (4 point charges, scattering)
 //
 //  Stack: AppKit + MetalKit + simd + ImageIO. No third-party dependencies.
-//  The Metal shader source is compiled at runtime (makeLibrary(source:)),
-//  so there is no .metallib build step and no Xcode project required.
+//  The Metal source is compiled at runtime (makeLibrary(source:)).
 //
 //  Build:
-//      swiftc EMFieldDemo.swift -o EMFieldDemo \
+//      swiftc -O EMFieldDemo.swift -o EMFieldDemo \
 //             -framework Cocoa -framework Metal -framework MetalKit
-//  Run:
-//      ./EMFieldDemo
 //
 //  Controls:
 //      1..6      switch scenario
-//      Space     pause / resume
-//      R         reset particle
+//      Space     pause / resume (freezes the trails too)
+//      R         reseed the swarm
 //      F         toggle field lines
-//      T         toggle trajectory trail
-//      A         toggle camera auto-rotation
-//      P         save a 1920x1080 PNG of the current frame (to CWD)
-//      drag      orbit camera
-//      scroll    zoom
-//
-//  Magnetic scenarios: Boris pusher (energy-preserving for the magnetic part).
-//  Electric scenarios: same integrator, the E half-kicks now do real work, so
-//  the test charge gains/loses energy and is re-injected when it leaves view.
-//  Field lines are traced on the CPU with RK4 along the normalized field and
-//  coloured by local magnitude (log-scaled).
+//      B         toggle bloom
+//      A         camera auto-rotation
+//      [ / ]     halve / double the particle count
+//      P         save a PNG of the current frame (to CWD)
+//      drag      orbit camera     scroll  zoom
 // =============================================================================
 
 import Cocoa
@@ -47,31 +42,63 @@ import UniformTypeIdentifiers
 
 // MARK: - Tunables
 
-private let kMaxTrail = 2400         // trajectory trail capacity (vertices)
-private let kReinject = Float(5.5)   // re-inject the particle when |pos| exceeds this
+private var   gParticleCount = 200_000       // swarm size (mutable via [ ])
+private let   kMaxParticles  = 2_000_000      // hard cap (buffer allocation)
+private let   kReinject      = Float(5.5)     // respawn when |pos| exceeds this
 
-// MARK: - Vertex / uniform layout (must match the MSL structs below)
+private let   kPointSize     = Float(3.0)     // particle sprite size (backing px)
+private let   kIntensity     = Float(0.07)    // per-particle additive brightness
+private let   kFade          = Float(0.90)    // trail persistence  (0=no trail,1=forever)
+private let   kExposure      = Float(1.15)
+private let   kBloomStrength  = Float(1.35)
+private let   kBloomThreshold = Float(1.0)
+
+// MARK: - CPU-side structs (must match the MSL structs below, byte-for-byte)
 
 struct LineVertex {
     var position: SIMD3<Float>
     var color:    SIMD4<Float>
 }
 
-struct Uniforms {
-    var viewProj:    float4x4         // 64 bytes
-    var particlePos: SIMD3<Float>     // 16 (aligned)
-    var cameraRight: SIMD3<Float>     // 16
-    var cameraUp:    SIMD3<Float>     // 16
-    var pointSize:   Float            // 4
-    var _pad0:       Float = 0        // padding -> stride stays 16-aligned (128)
-    var _pad1:       SIMD2<Float> = .zero
+struct SimU {                 // compute uniforms (48 bytes)
+    var dt: Float
+    var qOverM: Float
+    var reinject: Float
+    var emitterRadius: Float
+    var scenario: UInt32
+    var substeps: UInt32
+    var frameSeed: UInt32
+    var count: UInt32
+    var vmin: Float
+    var vmax: Float
+    var _p0: Float = 0
+    var _p1: Float = 0
+}
+
+struct RenderU {              // particle vertex uniforms (80 bytes)
+    var viewProj: float4x4
+    var pointSize: Float
+    var speedScale: Float
+    var intensity: Float
+    var _pad: Float = 0
+}
+
+struct LineU {               // line vertex uniforms (64 bytes)
+    var viewProj: float4x4
+}
+
+struct CompositeU {          // composite fragment uniforms (16 bytes)
+    var exposure: Float
+    var bloomStrength: Float
+    var bgIntensity: Float
+    var _pad: Float = 0
 }
 
 @inline(__always) func rgba(_ c: SIMD3<Float>, _ a: Float) -> SIMD4<Float> {
     SIMD4<Float>(c.x, c.y, c.z, a)
 }
 
-// MARK: - Math helpers (Metal-compatible matrices, NDC z in [0,1])
+// MARK: - Math helpers (Metal-compatible, NDC z in [0,1])
 
 func perspectiveRH(fovyRadians: Float, aspect: Float, near: Float, far: Float) -> float4x4 {
     let ys = 1 / tan(fovyRadians * 0.5)
@@ -86,7 +113,7 @@ func perspectiveRH(fovyRadians: Float, aspect: Float, near: Float, far: Float) -
 }
 
 func lookAtRH(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> float4x4 {
-    let z = normalize(eye - center)        // camera looks down -z
+    let z = normalize(eye - center)
     let x = normalize(cross(up, z))
     let y = cross(z, x)
     let t = SIMD3<Float>(-dot(x, eye), -dot(y, eye), -dot(z, eye))
@@ -98,14 +125,14 @@ func lookAtRH(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> floa
     ))
 }
 
-/// Cool-to-warm 5-stop colour map, input clamped to [0,1].
+/// Cool-to-warm 5-stop colour map, input clamped to [0,1] (CPU copy for lines).
 func colormap(_ t: Float) -> SIMD3<Float> {
     let stops: [SIMD3<Float>] = [
-        SIMD3(0.10, 0.20, 0.78),   // deep blue
-        SIMD3(0.10, 0.74, 0.86),   // cyan
-        SIMD3(0.30, 0.85, 0.38),   // green
-        SIMD3(0.96, 0.85, 0.26),   // gold
-        SIMD3(0.96, 0.30, 0.20)    // red
+        SIMD3(0.10, 0.20, 0.78),
+        SIMD3(0.10, 0.74, 0.86),
+        SIMD3(0.30, 0.85, 0.38),
+        SIMD3(0.96, 0.85, 0.26),
+        SIMD3(0.96, 0.30, 0.20)
     ]
     let x = max(0, min(1, t)) * 4.0
     let i = min(3, Int(x))
@@ -118,27 +145,28 @@ enum LineField { case magnetic, electric }
 
 struct Scenario {
     let name: String
-    /// Returns the (E, B) field at a point.
     let field: (SIMD3<Float>) -> (E: SIMD3<Float>, B: SIMD3<Float>)
     let q: Float
     let m: Float
     let dt: Float
     let substeps: Int
-    let initialPos: SIMD3<Float>
-    let initialVel: SIMD3<Float>
     let cameraDistance: Float
-    let seeds: [SIMD3<Float>]            // field-line seed points
-    let uniformLineColor: SIMD3<Float>?  // non-nil for spatially uniform fields
-    // defaults below keep the existing memberwise calls valid
-    var lineField: LineField = .magnetic // which field to trace lines along
-    var stopSites: [SIMD3<Float>] = []   // point charges: stop tracing nearby
+    let seeds: [SIMD3<Float>]
+    let uniformLineColor: SIMD3<Float>?
+    // swarm emitter parameters
+    var emitterRadius: Float = 2.4
+    var vMin: Float = 0.6
+    var vMax: Float = 1.8
+    var speedScale: Float = 0.35
+    // field-line tracing
+    var lineField: LineField = .magnetic
+    var stopSites: [SIMD3<Float>] = []
 }
 
 enum Scenarios {
 
     static let count = 6
 
-    // --- 1. Magnetic dipole (axis = z) -------------------------------------
     static func dipole() -> Scenario {
         let k: Float = 1.4
         let field: (SIMD3<Float>) -> (SIMD3<Float>, SIMD3<Float>) = { p in
@@ -160,12 +188,10 @@ enum Scenarios {
         return Scenario(
             name: "Magnetic dipole",
             field: field, q: 4.0, m: 1.0, dt: 0.0035, substeps: 8,
-            initialPos: SIMD3(1.7, 0.0, 0.25),
-            initialVel: SIMD3(0.0, 1.5, 0.45),
-            cameraDistance: 7.0, seeds: seeds, uniformLineColor: nil)
+            cameraDistance: 7.0, seeds: seeds, uniformLineColor: nil,
+            emitterRadius: 2.6, vMin: 0.8, vMax: 2.0, speedScale: 0.30)
     }
 
-    // --- 2. Magnetic quadrupole (B in the xy-plane) ------------------------
     static func quadrupole() -> Scenario {
         let g: Float = 2.0
         let field: (SIMD3<Float>) -> (SIMD3<Float>, SIMD3<Float>) = { p in
@@ -181,12 +207,10 @@ enum Scenarios {
         return Scenario(
             name: "Magnetic quadrupole",
             field: field, q: 2.0, m: 1.0, dt: 0.004, substeps: 8,
-            initialPos: SIMD3(0.65, 0.05, -2.6),
-            initialVel: SIMD3(0.0, 0.0, 1.6),
-            cameraDistance: 7.5, seeds: seeds, uniformLineColor: nil)
+            cameraDistance: 7.5, seeds: seeds, uniformLineColor: nil,
+            emitterRadius: 2.4, vMin: 0.6, vMax: 1.6, speedScale: 0.30)
     }
 
-    // --- 3. Cyclotron (uniform B along z) ----------------------------------
     static func cyclotron() -> Scenario {
         let b0: Float = 2.5
         let field: (SIMD3<Float>) -> (SIMD3<Float>, SIMD3<Float>) = { _ in
@@ -202,13 +226,11 @@ enum Scenarios {
         return Scenario(
             name: "Cyclotron (uniform B)",
             field: field, q: 1.0, m: 1.0, dt: 0.006, substeps: 6,
-            initialPos: SIMD3(1.0, 0.0, -1.6),
-            initialVel: SIMD3(0.0, 1.2, 0.55),
             cameraDistance: 7.0, seeds: seeds,
-            uniformLineColor: SIMD3(0.25, 0.55, 0.95))
+            uniformLineColor: SIMD3(0.25, 0.55, 0.95),
+            emitterRadius: 2.6, vMin: 0.6, vMax: 1.8, speedScale: 0.35)
     }
 
-    // --- 4. Magnetic bottle / mirror (axis = z) ----------------------------
     static func bottle() -> Scenario {
         let b0: Float = 1.0
         let L:  Float = 1.6
@@ -228,23 +250,20 @@ enum Scenarios {
         return Scenario(
             name: "Magnetic bottle (mirror)",
             field: field, q: 3.0, m: 1.0, dt: 0.0045, substeps: 8,
-            initialPos: SIMD3(0.5, 0.0, 0.0),
-            initialVel: SIMD3(0.0, 1.0, 0.8),
-            cameraDistance: 7.0, seeds: seeds, uniformLineColor: nil)
+            cameraDistance: 7.0, seeds: seeds, uniformLineColor: nil,
+            emitterRadius: 1.8, vMin: 0.6, vMax: 1.6, speedScale: 0.35)
     }
 
-    // --- Coulomb field of a set of point charges (k = 1) -------------------
     static func coulomb(_ p: SIMD3<Float>, _ charges: [(SIMD3<Float>, Float)]) -> SIMD3<Float> {
         var e = SIMD3<Float>(0, 0, 0)
         for (c, qc) in charges {
             let d = p - c
-            let r = max(length(d), 0.28)   // softening
+            let r = max(length(d), 0.28)
             e += qc * d / (r * r * r)
         }
         return e
     }
 
-    /// Seed a ring bundle around a (positive) charge, from which E-lines emanate.
     static func seedsAround(_ center: SIMD3<Float>, radius: Float,
                             azimuths: Int, polars: [Float]) -> [SIMD3<Float>] {
         var out: [SIMD3<Float>] = []
@@ -258,7 +277,6 @@ enum Scenarios {
         return out
     }
 
-    // --- 5. Electric dipole (+q and -q on the x-axis) ----------------------
     static func electricDipole() -> Scenario {
         let charges: [(SIMD3<Float>, Float)] = [
             (SIMD3(-1.2, 0, 0),  1),
@@ -272,13 +290,11 @@ enum Scenarios {
         return Scenario(
             name: "Electric dipole",
             field: field, q: 1.0, m: 1.0, dt: 0.004, substeps: 8,
-            initialPos: SIMD3(0.0, 1.9, 0.25),
-            initialVel: SIMD3(0.85, 0.0, 0.0),
             cameraDistance: 7.5, seeds: seeds, uniformLineColor: nil,
+            emitterRadius: 2.2, vMin: 0.4, vMax: 1.2, speedScale: 0.40,
             lineField: .electric, stopSites: charges.map { $0.0 })
     }
 
-    // --- 6. Electric quadrupole (+,+ on x-axis, -,- on y-axis) -------------
     static func electricQuadrupole() -> Scenario {
         let charges: [(SIMD3<Float>, Float)] = [
             (SIMD3( 1.2, 0, 0),  1),
@@ -297,9 +313,8 @@ enum Scenarios {
         return Scenario(
             name: "Electric quadrupole",
             field: field, q: 1.0, m: 1.0, dt: 0.004, substeps: 8,
-            initialPos: SIMD3(2.3, 0.35, 0.0),
-            initialVel: SIMD3(-1.05, 0.15, 0.0),
             cameraDistance: 7.8, seeds: seeds, uniformLineColor: nil,
+            emitterRadius: 2.4, vMin: 0.4, vMax: 1.2, speedScale: 0.40,
             lineField: .electric, stopSites: charges.map { $0.0 })
     }
 
@@ -315,23 +330,7 @@ enum Scenarios {
     }
 }
 
-// MARK: - Physics: Boris pusher
-
-func borisStep(pos: inout SIMD3<Float>, vel: inout SIMD3<Float>,
-               q: Float, m: Float, dt: Float,
-               field: (SIMD3<Float>) -> (E: SIMD3<Float>, B: SIMD3<Float>)) {
-    let f = field(pos)
-    let h = (q / m) * dt * 0.5
-    let vMinus = vel + h * f.E                 // half E kick
-    let t  = h * f.B                            // rotation by B
-    let s  = (2.0 / (1.0 + dot(t, t))) * t
-    let vP = vMinus + cross(vMinus, t)
-    let vPlus = vMinus + cross(vP, s)
-    vel = vPlus + h * f.E                       // second half E kick
-    pos = pos + vel * dt
-}
-
-// MARK: - Field-line tracing (CPU, RK4 along normalized field)
+// MARK: - Field-line tracing (CPU, RK4 along normalized field) — unchanged
 
 func traceLine(seed: SIMD3<Float>, sign: Float, steps: Int, ds: Float,
                field: (SIMD3<Float>) -> SIMD3<Float>,
@@ -353,15 +352,13 @@ func traceLine(seed: SIMD3<Float>, sign: Float, steps: Int, ds: Float,
         if stopR > 0 {
             var hit = false
             for s in sites where length(p - s) < stopR { hit = true; break }
-            if hit { pts.append(p); break }     // terminate the line on the sink charge
+            if hit { pts.append(p); break }
         }
         pts.append(p)
     }
     return pts
 }
 
-/// Builds line-segment geometry (MTLPrimitiveType.line) for all seeds,
-/// coloured by log magnitude of the traced field.
 func buildFieldLines(_ s: Scenario) -> [LineVertex] {
     let fvec: (SIMD3<Float>) -> SIMD3<Float> =
         (s.lineField == .electric) ? { s.field($0).E } : { s.field($0).B }
@@ -391,10 +388,12 @@ func buildFieldLines(_ s: Scenario) -> [LineVertex] {
     }
     let span = max(hi - lo, 1e-4)
 
+    // Lines live in an HDR layer; push them above the bloom threshold so they glow.
+    let lineBright: Float = 5
     func colorAt(_ p: SIMD3<Float>) -> SIMD4<Float> {
-        if let c = s.uniformLineColor { return rgba(c, 0.85) }
+        if let c = s.uniformLineColor { return rgba(c * lineBright, 1.0) }
         let t = (log(length(fvec(p)) + 1e-6) - lo) / span
-        return rgba(colormap(t), 0.85)
+        return rgba(colormap(t) * lineBright, 1.0)
     }
 
     var verts: [LineVertex] = []
@@ -407,32 +406,27 @@ func buildFieldLines(_ s: Scenario) -> [LineVertex] {
     return verts
 }
 
-/// Static reference axes (dim), drawn as a line list.
 func buildAxes() -> [LineVertex] {
     let L: Float = 3.0
-    let a: Float = 0.22
+    let a: Float = 0.30                       // additive glow amount
     func seg(_ p0: SIMD3<Float>, _ p1: SIMD3<Float>, _ c: SIMD3<Float>) -> [LineVertex] {
-        [LineVertex(position: p0, color: rgba(c, a)),
-         LineVertex(position: p1, color: rgba(c, a))]
+        [LineVertex(position: p0, color: rgba(c * a, 1.0)),
+         LineVertex(position: p1, color: rgba(c * a, 1.0))]
     }
     return seg(SIMD3(-L,0,0), SIMD3(L,0,0), SIMD3(0.9,0.3,0.3))
          + seg(SIMD3(0,-L,0), SIMD3(0,L,0), SIMD3(0.3,0.9,0.3))
          + seg(SIMD3(0,0,-L), SIMD3(0,0,L), SIMD3(0.3,0.5,0.95))
 }
 
-// MARK: - World (shared mutable state, main thread only)
+// MARK: - World
 
 final class World {
     private(set) var scenarioIndex = 0
     private(set) var scenario = Scenarios.make(0)
 
-    var pos = SIMD3<Float>(0, 0, 0)
-    var vel = SIMD3<Float>(0, 0, 0)
-    var trail: [SIMD3<Float>] = []
-
     var paused = false
     var showFieldLines = true
-    var showTrail = true
+    var bloomEnabled = true
     var autoRotate = true
 
     var azimuth: Float = 0.7
@@ -441,7 +435,6 @@ final class World {
 
     private(set) var fieldLineVerts: [LineVertex] = []
     private(set) var axisVerts: [LineVertex] = buildAxes()
-    var fieldLinesDirty = true
 
     init() { loadScenario(0) }
 
@@ -449,40 +442,7 @@ final class World {
         scenarioIndex = ((i % Scenarios.count) + Scenarios.count) % Scenarios.count
         scenario = Scenarios.make(scenarioIndex)
         distance = scenario.cameraDistance
-        resetParticle()
         fieldLineVerts = buildFieldLines(scenario)
-        fieldLinesDirty = true
-    }
-
-    func resetParticle() {
-        pos = scenario.initialPos
-        vel = scenario.initialVel
-        trail.removeAll(keepingCapacity: true)
-    }
-
-    func step() {
-        guard !paused else { return }
-        let s = scenario
-        for _ in 0..<s.substeps {
-            borisStep(pos: &pos, vel: &vel, q: s.q, m: s.m, dt: s.dt, field: s.field)
-            if length(pos) > kReinject { resetParticle(); break }
-            trail.append(pos)
-            if trail.count > kMaxTrail { trail.removeFirst(trail.count - kMaxTrail) }
-        }
-    }
-
-    func trailVerts() -> [LineVertex] {
-        guard trail.count > 1 else { return [] }
-        let n = trail.count
-        var out: [LineVertex] = []
-        out.reserveCapacity(n)
-        for (i, p) in trail.enumerated() {
-            let age = Float(i) / Float(n - 1)
-            let c = mix(SIMD3<Float>(0.35, 0.55, 1.0),
-                        SIMD3<Float>(0.6, 1.0, 1.0), t: age)
-            out.append(LineVertex(position: p, color: rgba(c, 0.15 + 0.85 * age)))
-        }
-        return out
     }
 }
 
@@ -492,52 +452,220 @@ private let kShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
-struct LineVertex { float3 position; float4 color; };
-
-struct Uniforms {
-    float4x4 viewProj;
-    float3   particlePos;
-    float3   cameraRight;
-    float3   cameraUp;
-    float    pointSize;
+struct SimU {
+    float dt, qOverM, reinject, emitterRadius;
+    uint  scenario, substeps, frameSeed, count;
+    float vmin, vmax, p0, p1;
 };
 
+struct RenderU {
+    float4x4 viewProj;
+    float pointSize;
+    float speedScale;
+    float intensity;
+    float pad;
+};
+
+struct LineU   { float4x4 viewProj; };
+struct CompU   { float exposure; float bloomStrength; float bgIntensity; float pad; };
+
+constexpr sampler samp(coord::normalized, address::clamp_to_edge, filter::linear);
+
+// ---- field model -----------------------------------------------------------
+struct Field { float3 E; float3 B; };
+
+inline Field fieldAt(float3 p, uint sc) {
+    Field f; f.E = float3(0.0); f.B = float3(0.0);
+    if (sc == 0u) {                         // magnetic dipole
+        float k = 1.4;
+        float r = max(length(p), 0.28);
+        float r5 = r*r*r*r*r;
+        f.B = float3(k*3.0*p.x*p.z/r5, k*3.0*p.y*p.z/r5, k*(3.0*p.z*p.z - r*r)/r5);
+    } else if (sc == 1u) {                  // magnetic quadrupole
+        float g = 2.0; f.B = float3(g*p.y, g*p.x, 0.0);
+    } else if (sc == 2u) {                  // cyclotron
+        f.B = float3(0.0, 0.0, 2.5);
+    } else if (sc == 3u) {                  // magnetic bottle
+        float b0 = 1.0, L = 1.6, invL2 = 1.0/(L*L);
+        f.B = float3(-b0*p.z*p.x*invL2, -b0*p.z*p.y*invL2, b0*(1.0 + p.z*p.z*invL2));
+    } else if (sc == 4u) {                  // electric dipole
+        float3 e = float3(0.0);
+        float3 d0 = p - float3(-1.2,0,0); float r0 = max(length(d0),0.28); e +=  d0/(r0*r0*r0);
+        float3 d1 = p - float3( 1.2,0,0); float r1 = max(length(d1),0.28); e += -d1/(r1*r1*r1);
+        f.E = e;
+    } else {                                // electric quadrupole
+        float3 e = float3(0.0);
+        float3 ch[4] = { float3(1.2,0,0), float3(-1.2,0,0), float3(0,1.2,0), float3(0,-1.2,0) };
+        float  qs[4] = { 1.0, 1.0, -1.0, -1.0 };
+        for (int i = 0; i < 4; ++i) {
+            float3 d = p - ch[i]; float r = max(length(d),0.28); e += qs[i]*d/(r*r*r);
+        }
+        f.E = e;
+    }
+    return f;
+}
+
+// ---- rng + emitter ----------------------------------------------------------
+inline uint  pcg(thread uint& s) {
+    s = s*747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+inline float rnd(thread uint& s) { return float(pcg(s)) * (1.0/4294967296.0); }
+
+inline float3 sampleBall(thread uint& s, float R) {
+    float u1 = rnd(s), u2 = rnd(s), u3 = rnd(s);
+    float r  = R * pow(u1, 1.0/3.0);
+    float ct = 2.0*u2 - 1.0;
+    float st = sqrt(max(0.0, 1.0 - ct*ct));
+    float ph = 6.28318530718 * u3;
+    return r * float3(st*cos(ph), st*sin(ph), ct);
+}
+inline float3 sampleVel(thread uint& s, float vmin, float vmax) {
+    float u1 = rnd(s), u2 = rnd(s), u3 = rnd(s);
+    float sp = mix(vmin, vmax, u1);
+    float ct = 2.0*u2 - 1.0;
+    float st = sqrt(max(0.0, 1.0 - ct*ct));
+    float ph = 6.28318530718 * u3;
+    return sp * float3(st*cos(ph), st*sin(ph), ct);
+}
+
+// ---- Boris pusher (compute) -------------------------------------------------
+kernel void integrate(device float4* posBuf  [[buffer(0)]],
+                      device float4* velBuf  [[buffer(1)]],
+                      constant SimU& u       [[buffer(2)]],
+                      uint gid               [[thread_position_in_grid]]) {
+    if (gid >= u.count) return;
+    float3 pos = posBuf[gid].xyz;
+    float3 vel = velBuf[gid].xyz;
+    float  h   = u.qOverM * u.dt * 0.5;
+
+    for (uint i = 0; i < u.substeps; ++i) {
+        Field f = fieldAt(pos, u.scenario);
+        float3 vm = vel + h * f.E;
+        float3 t  = h * f.B;
+        float3 s  = (2.0 / (1.0 + dot(t,t))) * t;
+        float3 vp = vm + cross(vm, t);
+        vel = vm + cross(vp, s) + h * f.E;
+        pos = pos + vel * u.dt;
+        if (length(pos) > u.reinject) {
+            uint st = gid*9781u + u.frameSeed*6271u + i*1300097u + 1u;
+            pos = sampleBall(st, u.emitterRadius);
+            vel = sampleVel(st, u.vmin, u.vmax);
+        }
+    }
+    posBuf[gid] = float4(pos, length(vel));   // pack speed into .w for the renderer
+    velBuf[gid] = float4(vel, 0.0);
+}
+
+// ---- particle sprites -------------------------------------------------------
+struct POut { float4 position [[position]]; float point_size [[point_size]]; float4 color; };
+
+inline float3 colormap(float t) {
+    const float3 c0 = float3(0.10, 0.20, 0.78);
+    const float3 c1 = float3(0.10, 0.74, 0.86);
+    const float3 c2 = float3(0.30, 0.85, 0.38);
+    const float3 c3 = float3(0.96, 0.85, 0.26);
+    const float3 c4 = float3(0.96, 0.30, 0.20);
+    float x = clamp(t, 0.0, 1.0) * 4.0;
+    if (x < 1.0) return mix(c0, c1, x);
+    if (x < 2.0) return mix(c1, c2, x-1.0);
+    if (x < 3.0) return mix(c2, c3, x-2.0);
+    return mix(c3, c4, x-3.0);
+}
+
+vertex POut particle_vertex(const device float4* posBuf [[buffer(0)]],
+                            constant RenderU& u          [[buffer(1)]],
+                            uint vid                     [[vertex_id]]) {
+    float4 pw = posBuf[vid];
+    POut o;
+    o.position   = u.viewProj * float4(pw.xyz, 1.0);
+    o.point_size = u.pointSize;
+    float t = clamp(pw.w * u.speedScale, 0.0, 1.0);
+    o.color = float4(colormap(t) * u.intensity, 1.0);
+    return o;
+}
+
+fragment float4 particle_fragment(POut in [[stage_in]], float2 pc [[point_coord]]) {
+    float2 d = pc - 0.5;
+    float a = exp(-dot(d, d) * 12.0);        // soft gaussian dot
+    return float4(in.color.rgb * a, a);      // additive (premultiplied)
+}
+
+// ---- fullscreen helpers -----------------------------------------------------
+struct FSOut { float4 position [[position]]; float2 uv; };
+
+vertex FSOut fs_vertex(uint vid [[vertex_id]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2);   // (0,0)(2,0)(0,2)
+    FSOut o;
+    o.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = float2(p.x, 1.0 - p.y);                // upright sampling
+    return o;
+}
+
+// fade pass: fragment output is ignored (source factor = zero); dst *= blendColor.
+fragment float4 fade_fragment(FSOut in [[stage_in]]) { return float4(0.0); }
+
+// bloom bright-pass (half res) — sums the particle accumulator and the line layer
+fragment float4 bright_fragment(FSOut in [[stage_in]],
+                                texture2d<float> accum [[texture(0)]],
+                                texture2d<float> lines [[texture(1)]],
+                                constant float& threshold [[buffer(0)]]) {
+    float3 c = accum.sample(samp, in.uv).rgb + lines.sample(samp, in.uv).rgb;
+    float  l = max(max(c.r, c.g), c.b);
+    float  k = max(0.0, l - threshold);
+    float3 outc = (l > 1e-5) ? c * (k / l) : float3(0.0);
+    return float4(outc, 1.0);
+}
+
+// separable gaussian blur (9-tap)
+fragment float4 blur_fragment(FSOut in [[stage_in]],
+                              texture2d<float> src [[texture(0)]],
+                              constant float2& dir [[buffer(0)]]) {
+    const float w[5] = { 0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216 };
+    float3 acc = src.sample(samp, in.uv).rgb * w[0];
+    for (int i = 1; i < 5; ++i) {
+        float2 off = dir * float(i);
+        acc += src.sample(samp, in.uv + off).rgb * w[i];
+        acc += src.sample(samp, in.uv - off).rgb * w[i];
+    }
+    return float4(acc, 1.0);
+}
+
+inline float3 aces(float3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a*x + b)) / (x * (c*x + d) + e), 0.0, 1.0);
+}
+
+fragment float4 composite_fragment(FSOut in [[stage_in]],
+                                   texture2d<float> accum [[texture(0)]],
+                                   texture2d<float> bloom [[texture(1)]],
+                                   texture2d<float> lines [[texture(2)]],
+                                   constant CompU& u      [[buffer(0)]]) {
+    float3 hdr = accum.sample(samp, in.uv).rgb
+               + lines.sample(samp, in.uv).rgb
+               + u.bloomStrength * bloom.sample(samp, in.uv).rgb;
+    float3 mapped = aces(u.exposure * hdr);
+    // dark radial-ish gradient background
+    float2 q = in.uv - 0.5;
+    float  vig = 1.0 - 0.8 * dot(q, q);
+    float3 bg = mix(float3(0.015, 0.02, 0.05), float3(0.0, 0.0, 0.015), in.uv.y) * vig * u.bgIntensity;
+    return float4(mapped + bg, 1.0);
+}
+
+// ---- field lines / axes -----------------------------------------------------
+struct LineVtx { float3 position; float4 color; };
 struct LineOut { float4 position [[position]]; float4 color; };
 
-vertex LineOut line_vertex(const device LineVertex* verts [[buffer(0)]],
-                           constant Uniforms& u           [[buffer(1)]],
-                           uint vid                       [[vertex_id]]) {
+vertex LineOut line_vertex(const device LineVtx* v [[buffer(0)]],
+                           constant LineU& u        [[buffer(1)]],
+                           uint vid                 [[vertex_id]]) {
     LineOut o;
-    o.position = u.viewProj * float4(verts[vid].position, 1.0);
-    o.color    = verts[vid].color;
+    o.position = u.viewProj * float4(v[vid].position, 1.0);
+    o.color    = v[vid].color;
     return o;
 }
-
-fragment float4 line_fragment(LineOut in [[stage_in]]) {
-    return in.color;
-}
-
-struct GlowOut { float4 position [[position]]; float2 uv; float4 color; };
-
-vertex GlowOut glow_vertex(constant Uniforms& u  [[buffer(1)]],
-                           constant float4& glow [[buffer(2)]],
-                           uint vid              [[vertex_id]]) {
-    float2 corners[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };
-    float2 c = corners[vid];
-    float3 wp = u.particlePos + (c.x * u.cameraRight + c.y * u.cameraUp) * u.pointSize;
-    GlowOut o;
-    o.position = u.viewProj * float4(wp, 1.0);
-    o.uv = c;
-    o.color = glow;
-    return o;
-}
-
-fragment float4 glow_fragment(GlowOut in [[stage_in]]) {
-    float r = length(in.uv);
-    float a = exp(-r * r * 3.0);                 // soft gaussian falloff
-    a = clamp(a, 0.0, 1.0);
-    return float4(in.color.rgb * a * in.color.a, a * in.color.a);  // premultiplied
-}
+fragment float4 line_fragment(LineOut in [[stage_in]]) { return in.color; }
 """
 
 // MARK: - Renderer
@@ -547,17 +675,38 @@ final class Renderer: NSObject, MTKViewDelegate {
     let queue: MTLCommandQueue
     let world: World
 
-    private var linePipeline: MTLRenderPipelineState!
-    private var glowPipeline: MTLRenderPipelineState!
-    private var dsLines: MTLDepthStencilState!
-    private var dsGlow:  MTLDepthStencilState!
+    // pipelines
+    private var integratePSO: MTLComputePipelineState!
+    private var particlePSO:  MTLRenderPipelineState!
+    private var fadePSO:      MTLRenderPipelineState!
+    private var brightPSO:    MTLRenderPipelineState!
+    private var blurPSO:      MTLRenderPipelineState!
+    private var compositePSO: MTLRenderPipelineState!
+    private var linePSO:      MTLRenderPipelineState!
+    // separate composite/line pipelines for PNG capture share the same bgra8 format,
+    // so they are reused directly.
 
+    // particle state
+    private var posBuf: MTLBuffer!
+    private var velBuf: MTLBuffer!
+
+    // cached line geometry (rebuilt on scenario change, not per frame)
     private var fieldBuffer: MTLBuffer?
     private var axisBuffer:  MTLBuffer?
-    private var trailBuffer: MTLBuffer!
 
-    private var aspect: Float = 1.0
-    private let clear = MTLClearColor(red: 0.02, green: 0.02, blue: 0.05, alpha: 1.0)
+    // offscreen targets
+    private var accumTex: MTLTexture?
+    private var lineTex:  MTLTexture?     // full res, redrawn fresh each frame
+    private var bloomA:   MTLTexture?     // half res
+    private var bloomB:   MTLTexture?
+    private var pxW = 0, pxH = 0
+    private var needsAccumClear = true
+
+    private var frameSeed: UInt32 = 1
+    private var captureRequested = false
+
+    private let drawableFormat: MTLPixelFormat = .bgra8Unorm
+    private let hdrFormat:       MTLPixelFormat = .rgba16Float
 
     init?(view: MTKView, world: World) {
         guard let dev = view.device ?? MTLCreateSystemDefaultDevice(),
@@ -565,95 +714,245 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.device = dev; self.queue = q; self.world = world
         super.init()
 
-        view.colorPixelFormat = .bgra8Unorm
-        view.depthStencilPixelFormat = .depth32Float
-        view.clearColor = clear
+        view.colorPixelFormat = drawableFormat
+        view.depthStencilPixelFormat = .invalid           // no depth needed
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        do { try buildPipelines(view: view) }
-        catch { print("Pipeline build failed: \(error)"); return nil }
-
-        trailBuffer = device.makeBuffer(length: MemoryLayout<LineVertex>.stride * kMaxTrail,
-                                        options: .storageModeShared)
-        axisBuffer = makeLineBuffer(world.axisVerts)
-        refreshFieldBuffer()
+        do { try buildPipelines() } catch {
+            print("Pipeline build failed: \(error)"); return nil
+        }
+        allocParticles()
+        seedParticles()
+        refreshLineBuffers()
     }
 
-    private func buildPipelines(view: MTKView) throws {
+    func refreshLineBuffers() {
+        if !world.axisVerts.isEmpty {
+            axisBuffer = device.makeBuffer(
+                bytes: world.axisVerts,
+                length: MemoryLayout<LineVertex>.stride * world.axisVerts.count,
+                options: .storageModeShared)
+        }
+        if !world.fieldLineVerts.isEmpty {
+            fieldBuffer = device.makeBuffer(
+                bytes: world.fieldLineVerts,
+                length: MemoryLayout<LineVertex>.stride * world.fieldLineVerts.count,
+                options: .storageModeShared)
+        } else {
+            fieldBuffer = nil
+        }
+    }
+
+    // ---- pipelines ----
+    private func buildPipelines() throws {
         let lib = try device.makeLibrary(source: kShaderSource, options: nil)
 
-        func pipeline(_ vfn: String, _ ffn: String, additive: Bool) throws -> MTLRenderPipelineState {
+        integratePSO = try device.makeComputePipelineState(
+            function: lib.makeFunction(name: "integrate")!)
+
+        func render(_ vfn: String, _ ffn: String, format: MTLPixelFormat,
+                    blend: String) throws -> MTLRenderPipelineState {
             let d = MTLRenderPipelineDescriptor()
             d.vertexFunction   = lib.makeFunction(name: vfn)
             d.fragmentFunction = lib.makeFunction(name: ffn)
-            d.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             let ca = d.colorAttachments[0]!
-            ca.pixelFormat = view.colorPixelFormat
-            ca.isBlendingEnabled = true
-            ca.rgbBlendOperation = .add
-            ca.alphaBlendOperation = .add
-            if additive {
-                ca.sourceRGBBlendFactor = .one
-                ca.sourceAlphaBlendFactor = .one
-                ca.destinationRGBBlendFactor = .one
-                ca.destinationAlphaBlendFactor = .one
-            } else {
+            ca.pixelFormat = format
+            switch blend {
+            case "additive":
+                ca.isBlendingEnabled = true
+                ca.rgbBlendOperation = .add; ca.alphaBlendOperation = .add
+                ca.sourceRGBBlendFactor = .one;  ca.sourceAlphaBlendFactor = .one
+                ca.destinationRGBBlendFactor = .one; ca.destinationAlphaBlendFactor = .one
+            case "fade":  // dst *= blendColor   (source factor zero)
+                ca.isBlendingEnabled = true
+                ca.rgbBlendOperation = .add; ca.alphaBlendOperation = .add
+                ca.sourceRGBBlendFactor = .zero; ca.sourceAlphaBlendFactor = .zero
+                ca.destinationRGBBlendFactor = .blendColor
+                ca.destinationAlphaBlendFactor = .blendAlpha
+            case "alpha":
+                ca.isBlendingEnabled = true
+                ca.rgbBlendOperation = .add; ca.alphaBlendOperation = .add
                 ca.sourceRGBBlendFactor = .sourceAlpha
                 ca.sourceAlphaBlendFactor = .one
                 ca.destinationRGBBlendFactor = .oneMinusSourceAlpha
                 ca.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            default:      // replace
+                ca.isBlendingEnabled = false
             }
             return try device.makeRenderPipelineState(descriptor: d)
         }
 
-        linePipeline = try pipeline("line_vertex", "line_fragment", additive: false)
-        glowPipeline = try pipeline("glow_vertex", "glow_fragment", additive: true)
-
-        let dl = MTLDepthStencilDescriptor()
-        dl.depthCompareFunction = .less; dl.isDepthWriteEnabled = true
-        dsLines = device.makeDepthStencilState(descriptor: dl)
-
-        let dg = MTLDepthStencilDescriptor()
-        dg.depthCompareFunction = .always; dg.isDepthWriteEnabled = false
-        dsGlow = device.makeDepthStencilState(descriptor: dg)
+        particlePSO  = try render("particle_vertex", "particle_fragment", format: hdrFormat,      blend: "additive")
+        fadePSO      = try render("fs_vertex",       "fade_fragment",     format: hdrFormat,      blend: "fade")
+        brightPSO    = try render("fs_vertex",       "bright_fragment",   format: hdrFormat,      blend: "none")
+        blurPSO      = try render("fs_vertex",       "blur_fragment",     format: hdrFormat,      blend: "none")
+        compositePSO = try render("fs_vertex",       "composite_fragment",format: drawableFormat, blend: "none")
+        linePSO      = try render("line_vertex",     "line_fragment",     format: hdrFormat,      blend: "additive")
     }
 
-    private func makeLineBuffer(_ verts: [LineVertex]) -> MTLBuffer? {
-        guard !verts.isEmpty else { return nil }
-        return device.makeBuffer(bytes: verts,
-                                 length: MemoryLayout<LineVertex>.stride * verts.count,
-                                 options: .storageModeShared)
+    // ---- particles ----
+    private func allocParticles() {
+        let len = MemoryLayout<SIMD4<Float>>.stride * kMaxParticles
+        posBuf = device.makeBuffer(length: len, options: .storageModeShared)
+        velBuf = device.makeBuffer(length: len, options: .storageModeShared)
     }
 
-    func refreshFieldBuffer() {
-        fieldBuffer = makeLineBuffer(world.fieldLineVerts)
-        world.fieldLinesDirty = false
+    func seedParticles() {
+        let s = world.scenario
+        let pos = posBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: kMaxParticles)
+        let vel = velBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: kMaxParticles)
+        for i in 0..<gParticleCount {
+            // uniform point in ball
+            let u1 = Float.random(in: 0...1), u2 = Float.random(in: 0...1), u3 = Float.random(in: 0...1)
+            let r = s.emitterRadius * pow(u1, 1.0/3.0)
+            let ct = 2*u2 - 1, st = (max(0, 1 - ct*ct)).squareRoot(), ph = 2*Float.pi*u3
+            let p = r * SIMD3<Float>(st*cos(ph), st*sin(ph), ct)
+            // random velocity
+            let v1 = Float.random(in: 0...1), v2 = Float.random(in: 0...1), v3 = Float.random(in: 0...1)
+            let sp = s.vMin + (s.vMax - s.vMin) * v1
+            let ct2 = 2*v2 - 1, st2 = (max(0, 1 - ct2*ct2)).squareRoot(), ph2 = 2*Float.pi*v3
+            let v = sp * SIMD3<Float>(st2*cos(ph2), st2*sin(ph2), ct2)
+            pos[i] = SIMD4<Float>(p, length(v))
+            vel[i] = SIMD4<Float>(v, 0)
+        }
     }
 
-    // Camera + uniforms for a given aspect ratio.
-    private func makeUniforms(aspect: Float) -> Uniforms {
+    // ---- offscreen targets ----
+    private func resize(_ w: Int, _ h: Int) {
+        guard w > 0, h > 0 else { return }
+        pxW = w; pxH = h
+        func tex(_ tw: Int, _ th: Int) -> MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: hdrFormat, width: max(1, tw), height: max(1, th), mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead]; d.storageMode = .private
+            return device.makeTexture(descriptor: d)!
+        }
+        accumTex = tex(w, h)
+        lineTex  = tex(w, h)
+        bloomA = tex(w/2, h/2)
+        bloomB = tex(w/2, h/2)
+        needsAccumClear = true
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        resize(Int(size.width), Int(size.height))
+    }
+
+    // ---- camera ----
+    private func viewProj(aspect: Float) -> float4x4 {
         let el = max(-1.45, min(1.45, world.elevation))
         let az = world.azimuth
         let eye = SIMD3<Float>(world.distance * cos(el) * cos(az),
                                world.distance * sin(el),
                                world.distance * cos(el) * sin(az))
-        let target = SIMD3<Float>(0, 0, 0)
-        let worldUp = SIMD3<Float>(0, 1, 0)
-        let forward = normalize(target - eye)
-        let right = normalize(cross(forward, worldUp))
-        let camUp = cross(right, forward)
-        let viewM = lookAtRH(eye: eye, center: target, up: worldUp)
+        let viewM = lookAtRH(eye: eye, center: .zero, up: SIMD3<Float>(0,1,0))
         let projM = perspectiveRH(fovyRadians: 0.9, aspect: aspect, near: 0.05, far: 100)
-        return Uniforms(viewProj: projM * viewM, particlePos: world.pos,
-                        cameraRight: right, cameraUp: camUp, pointSize: 0.18)
+        return projM * viewM
     }
 
-    // Shared encode path for both the live view and the offscreen PNG capture.
-    private func encodeScene(_ enc: MTLRenderCommandEncoder, _ base: Uniforms) {
-        var u = base
-        enc.setRenderPipelineState(linePipeline)
-        enc.setDepthStencilState(dsLines)
-        enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+    // ---- per-frame passes (shared by screen + capture composite) ----
 
+    private func simStep(_ cmd: MTLCommandBuffer) {
+        guard !world.paused else { return }
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        var u = SimU(dt: world.scenario.dt,
+                     qOverM: world.scenario.q / world.scenario.m,
+                     reinject: kReinject,
+                     emitterRadius: world.scenario.emitterRadius,
+                     scenario: UInt32(world.scenarioIndex),
+                     substeps: UInt32(world.scenario.substeps),
+                     frameSeed: frameSeed,
+                     count: UInt32(gParticleCount),
+                     vmin: world.scenario.vMin, vmax: world.scenario.vMax)
+        enc.setComputePipelineState(integratePSO)
+        enc.setBuffer(posBuf, offset: 0, index: 0)
+        enc.setBuffer(velBuf, offset: 0, index: 1)
+        enc.setBytes(&u, length: MemoryLayout<SimU>.stride, index: 2)
+        let tg = MTLSize(width: 256, height: 1, depth: 1)
+        let ng = MTLSize(width: (gParticleCount + 255) / 256, height: 1, depth: 1)
+        enc.dispatchThreadgroups(ng, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    private func accumStep(_ cmd: MTLCommandBuffer, vp: float4x4) {
+        guard let accum = accumTex else { return }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = accum
+        rpd.colorAttachments[0].loadAction = needsAccumClear ? .clear : .load
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        rpd.colorAttachments[0].storeAction = .store
+        needsAccumClear = false
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+
+        // 1) fade the accumulated trails: dst *= kFade
+        if !world.paused {
+            enc.setRenderPipelineState(fadePSO)
+            enc.setBlendColor(red: kFade, green: kFade, blue: kFade, alpha: kFade)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+
+            // 2) additive particle sprites
+            var ru = RenderU(viewProj: vp, pointSize: kPointSize,
+                             speedScale: world.scenario.speedScale, intensity: kIntensity)
+            enc.setRenderPipelineState(particlePSO)
+            enc.setVertexBuffer(posBuf, offset: 0, index: 0)
+            enc.setVertexBytes(&ru, length: MemoryLayout<RenderU>.stride, index: 1)
+            enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: gParticleCount)
+        }
+        enc.endEncoding()
+    }
+
+    private func bloomStep(_ cmd: MTLCommandBuffer) {
+        guard world.bloomEnabled,
+              let accum = accumTex, let lines = lineTex,
+              let bA = bloomA, let bB = bloomB else { return }
+
+        func pass(_ target: MTLTexture, _ src: MTLTexture, src2: MTLTexture? = nil,
+                  pso: MTLRenderPipelineState,
+                  setup: (MTLRenderCommandEncoder) -> Void) {
+            let rpd = MTLRenderPassDescriptor()
+            rpd.colorAttachments[0].texture = target
+            rpd.colorAttachments[0].loadAction = .dontCare
+            rpd.colorAttachments[0].storeAction = .store
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+            enc.setRenderPipelineState(pso)
+            enc.setFragmentTexture(src, index: 0)
+            if let s2 = src2 { enc.setFragmentTexture(s2, index: 1) }
+            setup(enc)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+        }
+
+        // bright pass: accum + lines -> bloomA
+        pass(bA, accum, src2: lines, pso: brightPSO) { enc in
+            var thr = kBloomThreshold
+            enc.setFragmentBytes(&thr, length: MemoryLayout<Float>.stride, index: 0)
+        }
+        let txl = SIMD2<Float>(1.0 / Float(max(1, pxW/2)), 1.0 / Float(max(1, pxH/2)))
+        // blur H: bloomA -> bloomB
+        pass(bB, bA, pso: blurPSO) { enc in
+            var dir = SIMD2<Float>(txl.x, 0)
+            enc.setFragmentBytes(&dir, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+        }
+        // blur V: bloomB -> bloomA
+        pass(bA, bB, pso: blurPSO) { enc in
+            var dir = SIMD2<Float>(0, txl.y)
+            enc.setFragmentBytes(&dir, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+        }
+    }
+
+    // Draw field lines + axes fresh into the HDR line layer (no persistence -> crisp,
+    // no smear under rotation; bloom then turns thin lines into glowing curves).
+    private func lineStep(_ cmd: MTLCommandBuffer, vp: float4x4) {
+        guard let lt = lineTex else { return }
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = lt
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        rpd.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        enc.setRenderPipelineState(linePSO)
+        var lu = LineU(viewProj: vp)
+        enc.setVertexBytes(&lu, length: MemoryLayout<LineU>.stride, index: 1)
         if let ab = axisBuffer {
             enc.setVertexBuffer(ab, offset: 0, index: 0)
             enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: world.axisVerts.count)
@@ -662,85 +961,72 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(fb, offset: 0, index: 0)
             enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: world.fieldLineVerts.count)
         }
-        if world.showTrail {
-            let tv = world.trailVerts()
-            if tv.count > 1 {
-                tv.withUnsafeBytes { raw in
-                    trailBuffer.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count)
-                }
-                enc.setVertexBuffer(trailBuffer, offset: 0, index: 0)
-                enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: tv.count)
-            }
-        }
-
-        // particle glow: additive halo + bright core
-        enc.setRenderPipelineState(glowPipeline)
-        enc.setDepthStencilState(dsGlow)
-
-        var halo = base; halo.pointSize = 0.42
-        enc.setVertexBytes(&halo, length: MemoryLayout<Uniforms>.stride, index: 1)
-        var haloColor = SIMD4<Float>(0.3, 0.7, 1.0, 0.5)
-        enc.setVertexBytes(&haloColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 2)
-        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-
-        var core = base; core.pointSize = 0.13
-        enc.setVertexBytes(&core, length: MemoryLayout<Uniforms>.stride, index: 1)
-        var coreColor = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
-        enc.setVertexBytes(&coreColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 2)
-        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-    }
-
-    // MARK: MTKViewDelegate
-
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        aspect = Float(max(size.width, 1) / max(size.height, 1))
-    }
-
-    func draw(in view: MTKView) {
-        if world.fieldLinesDirty { refreshFieldBuffer() }
-        world.step()
-
-        guard let rpd = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
-              let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
-
-        encodeScene(enc, makeUniforms(aspect: aspect))
         enc.endEncoding()
-        cmd.present(drawable)
+    }
+
+    private func compositeStep(_ enc: MTLRenderCommandEncoder, vp: float4x4) {
+        guard let accum = accumTex, let lines = lineTex else { return }
+        enc.setRenderPipelineState(compositePSO)
+        enc.setFragmentTexture(accum, index: 0)
+        enc.setFragmentTexture(world.bloomEnabled ? (bloomA ?? accum) : accum, index: 1)
+        enc.setFragmentTexture(lines, index: 2)
+        var cu = CompositeU(exposure: kExposure,
+                            bloomStrength: world.bloomEnabled ? kBloomStrength : 0,
+                            bgIntensity: 1.0)
+        enc.setFragmentBytes(&cu, length: MemoryLayout<CompositeU>.stride, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    }
+
+    // ---- MTKViewDelegate ----
+    func draw(in view: MTKView) {
+        let w = Int(view.drawableSize.width), h = Int(view.drawableSize.height)
+        if accumTex == nil || pxW != w || pxH != h { resize(w, h) }
+        let aspect = Float(max(w, 1)) / Float(max(h, 1))
+        let vp = viewProj(aspect: aspect)
+
+        guard let cmd = queue.makeCommandBuffer() else { return }
+
+        simStep(cmd)
+        accumStep(cmd, vp: vp)
+        lineStep(cmd, vp: vp)
+        bloomStep(cmd)
+
+        if let rpd = view.currentRenderPassDescriptor,
+           let drawable = view.currentDrawable,
+           let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) {
+            compositeStep(enc, vp: vp)
+            enc.endEncoding()
+            cmd.present(drawable)
+        }
         cmd.commit()
 
-        if world.autoRotate { world.azimuth += 0.0025 }
+        if captureRequested { captureRequested = false; capture(vp: vp) }
+
+        if world.autoRotate && !world.paused { world.azimuth += 0.0025 }
+        frameSeed &+= 1
     }
 
-    // MARK: PNG capture (offscreen render -> blit to buffer -> ImageIO)
+    func requestCapture() { captureRequested = true }
 
-    func capture(width W: Int = 1920, height H: Int = 1080) {
-        let cd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                          width: W, height: H, mipmapped: false)
+    // ---- PNG capture (composite into an offscreen bgra8 target, current size) ----
+    private func capture(vp: float4x4) {
+        let W = max(1, pxW), H = max(1, pxH)
+        let cd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: drawableFormat, width: W, height: H, mipmapped: false)
         cd.usage = [.renderTarget, .shaderRead]; cd.storageMode = .private
-        let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
-                                                          width: W, height: H, mipmapped: false)
-        dd.usage = [.renderTarget]; dd.storageMode = .private
         guard let colorTex = device.makeTexture(descriptor: cd),
-              let depthTex = device.makeTexture(descriptor: dd) else { return }
+              let cmd = queue.makeCommandBuffer() else { return }
 
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = colorTex
         rpd.colorAttachments[0].loadAction = .clear
-        rpd.colorAttachments[0].clearColor = clear
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         rpd.colorAttachments[0].storeAction = .store
-        rpd.depthAttachment.texture = depthTex
-        rpd.depthAttachment.loadAction = .clear
-        rpd.depthAttachment.clearDepth = 1.0
-        rpd.depthAttachment.storeAction = .dontCare
-
-        guard let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
-        encodeScene(enc, makeUniforms(aspect: Float(W) / Float(H)))
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        compositeStep(enc, vp: vp)
         enc.endEncoding()
 
-        let rowBytes = ((W * 4 + 255) / 256) * 256          // 256-byte aligned for blit
+        let rowBytes = ((W * 4 + 255) / 256) * 256
         guard let outBuf = device.makeBuffer(length: rowBytes * H, options: .storageModeShared),
               let blit = cmd.makeBlitCommandEncoder() else { return }
         blit.copy(from: colorTex, sourceSlice: 0, sourceLevel: 0,
@@ -750,38 +1036,34 @@ final class Renderer: NSObject, MTKViewDelegate {
                   destinationBytesPerRow: rowBytes,
                   destinationBytesPerImage: rowBytes * H)
         blit.endEncoding()
-        cmd.commit()
-        cmd.waitUntilCompleted()
-
+        cmd.commit(); cmd.waitUntilCompleted()
         writePNG(outBuf.contents(), width: W, height: H, rowBytes: rowBytes)
     }
 
     private func writePNG(_ data: UnsafeMutableRawPointer, width: Int, height: Int, rowBytes: Int) {
         guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return }
-        // BGRA bytes read as a little-endian 32-bit word => skip the high (alpha) byte.
         let bmp = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
         guard let ctx = CGContext(data: data, width: width, height: height,
                                   bitsPerComponent: 8, bytesPerRow: rowBytes,
                                   space: cs, bitmapInfo: bmp),
               let img = ctx.makeImage() else { return }
-
         let name = "emfield_\(Int(Date().timeIntervalSince1970)).png"
         let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(name)
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL,
-                                                         UTType.png.identifier as CFString,
-                                                         1, nil) else { return }
+                                                         UTType.png.identifier as CFString, 1, nil) else { return }
         CGImageDestinationAddImage(dest, img, nil)
         if CGImageDestinationFinalize(dest) { print("Saved \(url.path)") }
         else { print("PNG export failed") }
     }
 }
 
-// MARK: - View (input handling)
+// MARK: - View (input)
 
 final class DemoView: MTKView {
     weak var world: World?
     var onScenarioChange: (() -> Void)?
+    var onReseed: (() -> Void)?
     var onCapture: (() -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
@@ -796,10 +1078,14 @@ final class DemoView: MTKView {
         case "5": switchTo(4)
         case "6": switchTo(5)
         case " ": w.paused.toggle()
-        case "r", "R": w.resetParticle()
+        case "r", "R": onReseed?()
         case "f", "F": w.showFieldLines.toggle()
-        case "t", "T": w.showTrail.toggle()
+        case "b", "B": w.bloomEnabled.toggle()
         case "a", "A": w.autoRotate.toggle()
+        case "[":
+            gParticleCount = max(10_000, gParticleCount / 2); onReseed?(); updateTitle()
+        case "]":
+            gParticleCount = min(kMaxParticles, gParticleCount * 2); onReseed?(); updateTitle()
         case "p", "P": onCapture?()
         default: break
         }
@@ -824,8 +1110,9 @@ final class DemoView: MTKView {
     }
 
     func updateTitle() {
-        window?.title = "EM Field Demo  —  [\(world?.scenario.name ?? "")]   "
-            + "(1-6 switch · Space pause · R reset · F lines · T trail · A spin · P png)"
+        let k = gParticleCount >= 1000 ? "\(gParticleCount/1000)k" : "\(gParticleCount)"
+        window?.title = "EM Field Demo  —  [\(world?.scenario.name ?? "")]  ·  \(k) particles   "
+            + "(1-6 · Space · R reseed · F lines · B bloom · A spin · [ ] count · P png)"
     }
 }
 
@@ -855,8 +1142,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         renderer = r
         view.delegate = r
-        view.onScenarioChange = { [weak r] in r?.refreshFieldBuffer() }
-        view.onCapture = { [weak r] in r?.capture() }
+        view.onScenarioChange = { [weak r] in r?.seedParticles(); r?.refreshLineBuffers() }
+        view.onReseed         = { [weak r] in r?.seedParticles() }
+        view.onCapture        = { [weak r] in r?.requestCapture() }
 
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
