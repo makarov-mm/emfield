@@ -1,34 +1,38 @@
 # EM Field Demo
 
-A real-time visualization of a charged particle moving through electromagnetic
-fields, with live tracing of the field lines. Written in **Swift + Metal**, no
-third-party dependencies, in a single source file.
+A GPU particle-swarm visualization of charged-particle motion in electromagnetic
+fields: **200,000+ test charges** pushed through analytic E/B fields entirely on
+the GPU (Boris pusher in a Metal compute kernel), rendered as additive HDR point
+sprites with light-painted trails, glowing field lines, and a bloom post pass.
 
-Six configurations are included: a magnetic dipole, a magnetic quadrupole, a
-cyclotron, a magnetic bottle, an electric dipole, and an electric quadrupole.
-The particle is integrated with a **Boris pusher**; the field lines are traced
-on the CPU with RK4 and coloured by local field strength.
+Written in **Swift + Metal**, single source file, no third-party dependencies,
+no Xcode project — the Metal shaders are compiled at runtime via
+`MTLDevice.makeLibrary(source:)`.
 
-> Press **P** at any time to save a 1920×1080 PNG of the current frame.
+> Press **P** at any time to save a PNG of the current frame, or **O** for a
+> 2× supersampled one.
 
 ## Screenshot
-![Screenshot](screenshot1.png)  
+
+![Screenshot](screenshot1.jpg)
 
 ## Scenarios
 
 | Key | Name | Field | What you see |
 |----|------|-------|--------------|
-| 1 | Magnetic dipole | `B ∝ [3(m·r̂)r̂ − m]/r³`, axis = z | A particle trapped in dipole field lines — spirals along a line and mirrors near the poles, like motion in a radiation belt. |
-| 2 | Magnetic quadrupole | `B = (g·y, g·x, 0)` | Hyperbolic field lines; the particle is focused in one transverse plane and defocused in the other (accelerator-style focusing). |
+| 1 | Magnetic dipole | `B ∝ [3(m·r̂)r̂ − m]/r³`, axis = z | Particles trapped on dipole field lines — they spiral along a line and mirror near the poles, like radiation-belt motion. |
+| 2 | Magnetic quadrupole | `B = (g·y, g·x, 0)` | Hyperbolic field lines; particles are focused in one transverse plane and defocused in the other (accelerator-style focusing). |
 | 3 | Cyclotron | `B = (0, 0, B₀)` (uniform) | The textbook helix: constant gyration plus a drift along the axis. |
-| 4 | Magnetic bottle | `B_z = B₀(1 + z²/L²)`, `B_⊥ = −B₀·z·r/L²` | A magnetic mirror. The particle bounces back and forth between the high-field throats. The field is divergence-free by construction (`∇·B = 0`). |
-| 5 | Electric dipole | Coulomb sum of `+q` and `−q` | Field lines run from the positive to the negative charge; the test charge is deflected as it passes through. |
-| 6 | Electric quadrupole | Four point charges (`+,+` on x, `−,−` on y) | The characteristic four-lobe pattern; the test charge follows a scattering trajectory. |
+| 4 | Magnetic bottle | `B_z = B₀(1 + z²/L²)`, `B_⊥ = −B₀·z·r/L²` | A magnetic mirror. Particles bounce back and forth between the high-field throats. Divergence-free by construction (`∇·B = 0`). |
+| 5 | Electric dipole | Coulomb sum of `+q` and `−q` | Field lines run from the positive to the negative charge; test charges are deflected as they pass through. |
+| 6 | Electric quadrupole | Four point charges (`+,+` on x, `−,−` on y) | The characteristic four-lobe pattern; test charges follow scattering trajectories. |
+| 7 | E × B drift | `E = (E₀,0,0)`, `B = (0,0,B₀)` | Every particle gyrates while its guiding centre drifts with `v_d = E×B/B²` — **independent of charge and speed** — so the whole swarm turns into a river of cycloids flowing the same way. |
+| 8 | Penning trap | uniform `B_z` + quadrupole `E = k(x, y, −2z)` | The electric field confines axially and *anti*-confines radially; `B` turns the radial escape into a slow magnetron circulation. Three superimposed motions (fast cyclotron + axial bounce + slow magnetron drift) paint rosette trails. Stable while `ω_c² > 2ω_z²`. |
 
-In the magnetic scenarios the field does no work, so the kinetic energy is
-conserved and orbits stay bounded. In the electric scenarios the `E` field does
-real work — the particle speeds up and slows down — so it is automatically
-re-injected at its start state once it leaves the view volume.
+In the magnetic scenarios the field does no work, so kinetic energy is conserved
+and orbits stay bounded. Where the `E` field does real work (or drifts carry
+particles away), any particle leaving the view volume is re-injected from the
+emitter with a fresh random state — the swarm reaches a visual steady state.
 
 ---
 
@@ -59,22 +63,28 @@ swiftc -O EMFieldDemo.swift -o EMFieldDemo \
 ./EMFieldDemo
 ```
 
-There is no Xcode project and no `.metallib` step — the Metal shaders are
-compiled at runtime via `MTLDevice.makeLibrary(source:)`.
-
 ---
 
 ## Controls
 
 | Input | Action |
 |-------|--------|
-| `1` … `6` | switch scenario |
-| `Space` | pause / resume |
-| `R` | reset the particle |
-| `F` | toggle field lines |
-| `T` | toggle the trajectory trail |
+| `1` … `8` | switch scenario |
+| `Space` | pause / resume (freezes the trails too) |
+| `R` | reseed the swarm |
+| `F` / `X` | toggle field lines / coordinate axes |
+| `B` | toggle bloom |
 | `A` | toggle camera auto-rotation |
-| `P` | save a PNG of the current frame |
+| `H` | toggle the HUD overlay |
+| `C` | cycle particle colour mode: speed → local \|field\| → ember |
+| `S` | slow motion (0.25×) on/off |
+| `[` / `]` | halve / double the particle count (10k … 2M) |
+| `-` / `=` | exposure down / up |
+| `,` / `.` | trail persistence down / up |
+| `;` / `'` | point size down / up |
+| `0` | reset all tunables |
+| `P` | save a PNG of the current frame (to CWD) |
+| `O` | save a 2× supersampled PNG |
 | mouse drag | orbit the camera |
 | scroll | zoom |
 
@@ -82,47 +92,72 @@ compiled at runtime via `MTLDevice.makeLibrary(source:)`.
 
 ## How it works
 
-**Integrator — Boris pusher.** Velocity is advanced with a symmetric pair of
-half-kicks by `E` around an exact rotation by `B`. The magnetic rotation
-preserves speed, so the scheme conserves energy for the magnetic part over long
-runs without the drift a naive Euler/RK integrator would accumulate.
+**Integrator — Boris pusher (GPU compute).** Each frame, a compute kernel
+advances every particle by several substeps. Velocity is updated with a
+symmetric pair of half-kicks by `E` around an exact rotation by `B`. The
+magnetic rotation preserves speed, so the scheme stays energy-stable for the
+magnetic part over long runs, without the secular drift a naive Euler/RK
+integrator would accumulate. Particle speed is packed into `position.w` so the
+renderer gets it for free.
 
-**Field-line tracing.** From a set of seed points, lines are integrated with
-RK4 along the normalized field. Magnetic lines are traced in both directions;
-electric lines are traced forward from rings around the positive charges and
-stop when they reach a charge. Each vertex is coloured by `log|field|` through a
-five-stop cool-to-warm map; spatially uniform fields get a single flat colour.
+**Re-injection.** Particles that leave the bounding sphere are respawned inside
+the emitter with a random position and velocity. The randomness comes from a
+PCG hash seeded per particle per frame — no random-number textures, no CPU
+round-trips.
 
-**Point-charge fields** use a softened Coulomb law (`r → max(|d|, ε)`) so the
-trajectory and the traced lines stay finite near a charge.
+**Trails — HDR feedback accumulation.** Particles are drawn as soft Gaussian
+point sprites with additive blending into a persistent `rgba16F` accumulation
+texture. Before each frame the texture is multiplied by a fade factor using a
+blend-state trick (source factor = zero, destination factor = blendColor), so
+trails decay exponentially with zero extra shader work.
 
-**Rendering — Metal.** Field lines and the fading trail are drawn as
-line primitives with alpha blending against a depth buffer. The particle is two
-additive billboard quads (a soft halo and a bright core) with a Gaussian
-falloff, giving a luminous point without a full bloom pass. An orbit camera with
-optional auto-rotation frames the scene.
+**Field lines.** Traced once per scenario on the CPU with RK4 along the
+normalized field. Magnetic lines are traced in both directions; electric lines
+run forward from rings around the positive charges and stop at a charge. Each
+vertex is coloured by `log|field|` through a five-stop cool-to-warm map;
+spatially uniform fields get a single flat colour. Lines are drawn fresh each
+frame into a separate HDR layer, so they stay crisp under camera rotation
+instead of smearing into the trails.
 
-**PNG export** renders the scene off-screen at 1920×1080 into a private texture,
-blits it into a buffer (row pitch aligned to 256 bytes), and writes a file with
-ImageIO. Frames are saved to the current working directory as
-`emfield_<timestamp>.png`, so run the binary from a terminal when capturing.
+**Post — bloom + ACES.** A bright-pass over the combined particle and line
+layers feeds a separable 9-tap Gaussian blur at half resolution; the composite
+pass adds the bloom back, applies exposure and an ACES tone-mapping curve, and
+lays everything over a subtle radial-gradient background.
+
+**Colour modes.** Particles can be coloured by their speed (default), by the
+local field magnitude at their position (the vertex shader re-evaluates the
+analytic field — cheap, since the field model lives in the same MSL source as
+the integrator), or with a monochrome "ember" ramp.
+
+**PNG export** re-composites the HDR layers into an offscreen `bgra8` target
+(optionally at 2× resolution), blits it into a buffer with 256-byte row
+alignment, and writes the file with ImageIO. Frames are saved to the current
+working directory as `emfield_<timestamp>.png`, so run the binary from a
+terminal when capturing.
+
+> The analytic field model exists twice on purpose: as Swift closures (used by
+> the CPU field-line tracer) and as `fieldAt()` in the MSL source (used by the
+> integrator and colour mode 1). If you add a scenario, update both.
 
 ---
 
 ## Tuning notes
 
 The initial conditions and field strengths are chosen so each scenario reads
-clearly on screen; all of them live in the `Scenarios` factory functions and are
-meant to be edited.
+clearly on screen; they live in the `Scenarios` factory functions and are meant
+to be edited.
 
 - **Magnetic dipole** is the most sensitive: the gyroradius must be noticeably
-  smaller than the field scale for the particle to follow a line adiabatically.
-  Adjust `q` and `initialVel` in `Scenarios.dipole()`.
+  smaller than the field scale for particles to follow a line adiabatically.
+  Adjust `q` and the emitter velocity range in `Scenarios.dipole()`.
 - **Magnetic quadrupole** has `B_z = 0`, so nothing confines motion along the
-  axis — the particle crosses through and is re-injected. Add a uniform `B_z`
-  component for a closed, bounded orbit.
-- **Electric scenarios** are scattering passes, not bound orbits, so the
-  trajectory depends strongly on where and how fast the test charge starts.
+  axis — particles cross through and are re-injected. Add a uniform `B_z`
+  component for closed, bounded orbits.
+- **Penning trap** stability requires `ω_c² > 2ω_z²`, i.e.
+  `(qB/m)² > 4kq/m`. Lower `B` below that and the swarm leaks out radially —
+  which is also fun to watch.
+- Live tunables (exposure, trail fade, point size, time scale) are on the
+  keyboard; press `0` to reset.
 
 ---
 

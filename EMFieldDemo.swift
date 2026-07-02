@@ -13,6 +13,8 @@
 //      4  Magnetic bottle      (magnetic mirror -> bouncing motion)
 //      5  Electric dipole      (Coulomb E-field, accelerated test charges)
 //      6  Electric quadrupole  (4 point charges, scattering)
+//      7  E x B drift          (crossed uniform fields -> cycloid drift)
+//      8  Penning trap         (uniform B + quadrupole E -> epicyclic orbits)
 //
 //  Stack: AppKit + MetalKit + simd + ImageIO. No third-party dependencies.
 //  The Metal source is compiled at runtime (makeLibrary(source:)).
@@ -22,14 +24,20 @@
 //             -framework Cocoa -framework Metal -framework MetalKit
 //
 //  Controls:
-//      1..6      switch scenario
+//      1..8      switch scenario
 //      Space     pause / resume (freezes the trails too)
 //      R         reseed the swarm
-//      F         toggle field lines
-//      B         toggle bloom
-//      A         camera auto-rotation
+//      F         toggle field lines        X   toggle axes
+//      B         toggle bloom              H   toggle the HUD
+//      A         camera auto-rotation      C   cycle particle colour mode
+//      S         slow motion (0.25x)
 //      [ / ]     halve / double the particle count
+//      - / =     exposure down / up
+//      , / .     trail persistence down / up
+//      ; / '     point size down / up
+//      0         reset all tunables
 //      P         save a PNG of the current frame (to CWD)
+//      O         save a 2x supersampled PNG
 //      drag      orbit camera     scroll  zoom
 // =============================================================================
 
@@ -38,6 +46,7 @@ import Metal
 import MetalKit
 import simd
 import ImageIO
+import QuartzCore
 import UniformTypeIdentifiers
 
 // MARK: - Tunables
@@ -46,12 +55,20 @@ private var   gParticleCount = 200_000       // swarm size (mutable via [ ])
 private let   kMaxParticles  = 2_000_000      // hard cap (buffer allocation)
 private let   kReinject      = Float(5.5)     // respawn when |pos| exceeds this
 
-private let   kPointSize     = Float(3.0)     // particle sprite size (backing px)
-private let   kIntensity     = Float(0.07)    // per-particle additive brightness
-private let   kFade          = Float(0.90)    // trail persistence  (0=no trail,1=forever)
-private let   kExposure      = Float(1.15)
-private let   kBloomStrength  = Float(1.35)
-private let   kBloomThreshold = Float(1.0)
+/// Everything that can be tweaked live from the keyboard.
+/// Press `0` to reset to these defaults.
+struct Tunables {
+    var pointSize:      Float  = 3.0    // particle sprite size (backing px)   ; / '
+    var intensity:      Float  = 0.07   // per-particle additive brightness
+    var fade:           Float  = 0.90   // trail persistence (0=none, 1=forever)  , / .
+    var exposure:       Float  = 1.15   // tone-mapping exposure                  - / =
+    var bloomStrength:  Float  = 1.35
+    var bloomThreshold: Float  = 1.0
+    var timeScale:      Float  = 1.0    // simulation speed multiplier            S
+    var colorMode:      UInt32 = 0      // 0 speed · 1 local |field| · 2 ember    C
+}
+
+let kColorModeNames = ["speed", "|field|", "ember"]
 
 // MARK: - CPU-side structs (must match the MSL structs below, byte-for-byte)
 
@@ -75,12 +92,16 @@ struct SimU {                 // compute uniforms (48 bytes)
     var _p1: Float = 0
 }
 
-struct RenderU {              // particle vertex uniforms (80 bytes)
+struct RenderU {              // particle vertex uniforms (96 bytes)
     var viewProj: float4x4
     var pointSize: Float
     var speedScale: Float
     var intensity: Float
-    var _pad: Float = 0
+    var colorMode: UInt32
+    var scenario: UInt32      // lets the vertex shader sample fieldAt() for mode 1
+    var _p0: Float = 0
+    var _p1: Float = 0
+    var _p2: Float = 0
 }
 
 struct LineU {               // line vertex uniforms (64 bytes)
@@ -165,7 +186,7 @@ struct Scenario {
 
 enum Scenarios {
 
-    static let count = 6
+    static let count = 8
 
     static func dipole() -> Scenario {
         let k: Float = 1.4
@@ -318,6 +339,60 @@ enum Scenarios {
             lineField: .electric, stopSites: charges.map { $0.0 })
     }
 
+    /// Crossed uniform fields: E along +x, B along +z.
+    /// Every particle gyrates while its guiding centre drifts with
+    /// v_d = E x B / |B|^2  (here: along -y), independent of charge and speed —
+    /// the swarm turns into a river of cycloids all flowing the same way.
+    static func crossedFields() -> Scenario {
+        let e0: Float = 1.2
+        let b0: Float = 2.0
+        let field: (SIMD3<Float>) -> (SIMD3<Float>, SIMD3<Float>) = { _ in
+            (SIMD3(e0, 0, 0), SIMD3(0, 0, b0))
+        }
+        // straight, uniform B lines on a grid (same style as the cyclotron)
+        var seeds: [SIMD3<Float>] = []
+        for ix in -2...2 {
+            for iy in -2...2 {
+                let p = SIMD3(Float(ix), Float(iy), 0)
+                if length(p) <= 2.6 { seeds.append(p) }
+            }
+        }
+        return Scenario(
+            name: "E x B drift",
+            field: field, q: 1.5, m: 1.0, dt: 0.005, substeps: 6,
+            cameraDistance: 7.5, seeds: seeds,
+            uniformLineColor: SIMD3(0.25, 0.55, 0.95),
+            emitterRadius: 2.2, vMin: 0.4, vMax: 1.2, speedScale: 0.40)
+    }
+
+    /// Ideal Penning trap: strong uniform B_z plus the quadrupole field
+    /// E = k (x, y, -2z), i.e. the potential  phi = k (z^2 - (x^2+y^2)/2).
+    /// The E field confines axially (F_z = -2kq z) and *anti*-confines radially;
+    /// B turns the radial escape into slow magnetron circulation. Stable while
+    /// w_c^2 > 2 w_z^2  (here 9 > 2.4). Orbits are three superimposed motions:
+    /// fast cyclotron + axial bounce + slow magnetron drift -> rosette trails.
+    static func penning() -> Scenario {
+        let b0: Float = 3.0
+        let k:  Float = 0.6
+        let field: (SIMD3<Float>) -> (SIMD3<Float>, SIMD3<Float>) = { p in
+            (SIMD3(k * p.x, k * p.y, -2 * k * p.z), SIMD3(0, 0, b0))
+        }
+        // electric field lines of the quadrupole-of-revolution (hyperbola-like)
+        var seeds: [SIMD3<Float>] = []
+        for ai in 0..<10 {
+            let az = Float(ai) * (.pi / 5)
+            for z in [Float(-1.4), -0.7, 0.7, 1.4] {
+                seeds.append(SIMD3(0.5 * cos(az), 0.5 * sin(az), z))
+            }
+        }
+        return Scenario(
+            name: "Penning trap",
+            field: field, q: 1.0, m: 1.0, dt: 0.004, substeps: 8,
+            cameraDistance: 6.0, seeds: seeds, uniformLineColor: nil,
+            emitterRadius: 1.3, vMin: 0.2, vMax: 0.9, speedScale: 0.55,
+            lineField: .electric)
+    }
+
     static func make(_ index: Int) -> Scenario {
         switch index {
         case 0:  return dipole()
@@ -325,7 +400,9 @@ enum Scenarios {
         case 2:  return cyclotron()
         case 3:  return bottle()
         case 4:  return electricDipole()
-        default: return electricQuadrupole()
+        case 5:  return electricQuadrupole()
+        case 6:  return crossedFields()
+        default: return penning()
         }
     }
 }
@@ -426,8 +503,11 @@ final class World {
 
     var paused = false
     var showFieldLines = true
+    var showAxes = true
     var bloomEnabled = true
     var autoRotate = true
+    var hudVisible = true
+    var tun = Tunables()
 
     var azimuth: Float = 0.7
     var elevation: Float = 0.4
@@ -463,7 +543,9 @@ struct RenderU {
     float pointSize;
     float speedScale;
     float intensity;
-    float pad;
+    uint  colorMode;
+    uint  scenario;
+    float p0, p1, p2;
 };
 
 struct LineU   { float4x4 viewProj; };
@@ -493,6 +575,13 @@ inline Field fieldAt(float3 p, uint sc) {
         float3 d0 = p - float3(-1.2,0,0); float r0 = max(length(d0),0.28); e +=  d0/(r0*r0*r0);
         float3 d1 = p - float3( 1.2,0,0); float r1 = max(length(d1),0.28); e += -d1/(r1*r1*r1);
         f.E = e;
+    } else if (sc == 6u) {                  // E x B drift (crossed uniform fields)
+        f.E = float3(1.2, 0.0, 0.0);
+        f.B = float3(0.0, 0.0, 2.0);
+    } else if (sc == 7u) {                  // Penning trap
+        float k = 0.6;
+        f.E = float3(k*p.x, k*p.y, -2.0*k*p.z);
+        f.B = float3(0.0, 0.0, 3.0);
     } else {                                // electric quadrupole
         float3 e = float3(0.0);
         float3 ch[4] = { float3(1.2,0,0), float3(-1.2,0,0), float3(0,1.2,0), float3(0,-1.2,0) };
@@ -581,8 +670,22 @@ vertex POut particle_vertex(const device float4* posBuf [[buffer(0)]],
     POut o;
     o.position   = u.viewProj * float4(pw.xyz, 1.0);
     o.point_size = u.pointSize;
-    float t = clamp(pw.w * u.speedScale, 0.0, 1.0);
-    o.color = float4(colormap(t) * u.intensity, 1.0);
+
+    float3 c;
+    if (u.colorMode == 1u) {
+        // colour by local field magnitude at the particle position
+        Field f = fieldAt(pw.xyz, u.scenario);
+        float m = length(f.B) + length(f.E);
+        c = colormap(clamp(log(1.0 + m) * 0.55, 0.0, 1.0));
+    } else if (u.colorMode == 2u) {
+        // monochrome "ember": dark red embers -> white-hot, weighted by speed
+        float t = clamp(pw.w * u.speedScale, 0.0, 1.0);
+        c = mix(float3(0.30, 0.09, 0.03), float3(1.0, 0.85, 0.55), t) * (0.4 + 1.6*t);
+    } else {
+        // default: colour by speed
+        c = colormap(clamp(pw.w * u.speedScale, 0.0, 1.0));
+    }
+    o.color = float4(c * u.intensity, 1.0);
     return o;
 }
 
@@ -704,6 +807,13 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private var frameSeed: UInt32 = 1
     private var captureRequested = false
+    private var captureScale = 1
+
+    // fps (exponential moving average) + throttled HUD refresh
+    private(set) var fps: Double = 0
+    private var lastFrameTime: CFTimeInterval = 0
+    private var lastHUDTime:   CFTimeInterval = 0
+    var onHUD: ((String) -> Void)?
 
     private let drawableFormat: MTLPixelFormat = .bgra8Unorm
     private let hdrFormat:       MTLPixelFormat = .rgba16Float
@@ -797,7 +907,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         velBuf = device.makeBuffer(length: len, options: .storageModeShared)
     }
 
+    /// Wipe the light-painted trails (used on reseed / scenario switch so stale
+    /// trails from the previous field don't linger under the new one).
+    func clearTrails() { needsAccumClear = true }
+
     func seedParticles() {
+        clearTrails()
         let s = world.scenario
         let pos = posBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: kMaxParticles)
         let vel = velBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: kMaxParticles)
@@ -855,7 +970,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private func simStep(_ cmd: MTLCommandBuffer) {
         guard !world.paused else { return }
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
-        var u = SimU(dt: world.scenario.dt,
+        var u = SimU(dt: world.scenario.dt * world.tun.timeScale,
                      qOverM: world.scenario.q / world.scenario.m,
                      reinject: kReinject,
                      emitterRadius: world.scenario.emitterRadius,
@@ -884,15 +999,19 @@ final class Renderer: NSObject, MTKViewDelegate {
         needsAccumClear = false
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
-        // 1) fade the accumulated trails: dst *= kFade
+        // 1) fade the accumulated trails: dst *= fade
         if !world.paused {
+            let fade = world.tun.fade
             enc.setRenderPipelineState(fadePSO)
-            enc.setBlendColor(red: kFade, green: kFade, blue: kFade, alpha: kFade)
+            enc.setBlendColor(red: fade, green: fade, blue: fade, alpha: fade)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 
             // 2) additive particle sprites
-            var ru = RenderU(viewProj: vp, pointSize: kPointSize,
-                             speedScale: world.scenario.speedScale, intensity: kIntensity)
+            var ru = RenderU(viewProj: vp, pointSize: world.tun.pointSize,
+                             speedScale: world.scenario.speedScale,
+                             intensity: world.tun.intensity,
+                             colorMode: world.tun.colorMode,
+                             scenario: UInt32(world.scenarioIndex))
             enc.setRenderPipelineState(particlePSO)
             enc.setVertexBuffer(posBuf, offset: 0, index: 0)
             enc.setVertexBytes(&ru, length: MemoryLayout<RenderU>.stride, index: 1)
@@ -924,7 +1043,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // bright pass: accum + lines -> bloomA
         pass(bA, accum, src2: lines, pso: brightPSO) { enc in
-            var thr = kBloomThreshold
+            var thr = world.tun.bloomThreshold
             enc.setFragmentBytes(&thr, length: MemoryLayout<Float>.stride, index: 0)
         }
         let txl = SIMD2<Float>(1.0 / Float(max(1, pxW/2)), 1.0 / Float(max(1, pxH/2)))
@@ -953,7 +1072,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setRenderPipelineState(linePSO)
         var lu = LineU(viewProj: vp)
         enc.setVertexBytes(&lu, length: MemoryLayout<LineU>.stride, index: 1)
-        if let ab = axisBuffer {
+        if world.showAxes, let ab = axisBuffer {
             enc.setVertexBuffer(ab, offset: 0, index: 0)
             enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: world.axisVerts.count)
         }
@@ -970,8 +1089,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setFragmentTexture(accum, index: 0)
         enc.setFragmentTexture(world.bloomEnabled ? (bloomA ?? accum) : accum, index: 1)
         enc.setFragmentTexture(lines, index: 2)
-        var cu = CompositeU(exposure: kExposure,
-                            bloomStrength: world.bloomEnabled ? kBloomStrength : 0,
+        var cu = CompositeU(exposure: world.tun.exposure,
+                            bloomStrength: world.bloomEnabled ? world.tun.bloomStrength : 0,
                             bgIntensity: 1.0)
         enc.setFragmentBytes(&cu, length: MemoryLayout<CompositeU>.stride, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -1000,17 +1119,53 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         cmd.commit()
 
-        if captureRequested { captureRequested = false; capture(vp: vp) }
+        if captureRequested { captureRequested = false; capture(vp: vp, scale: captureScale) }
 
         if world.autoRotate && !world.paused { world.azimuth += 0.0025 }
         frameSeed &+= 1
+
+        // fps (EMA) + throttled HUD refresh (draw runs on the main thread)
+        let now = CACurrentMediaTime()
+        if lastFrameTime > 0 {
+            let inst = 1.0 / max(now - lastFrameTime, 1e-6)
+            fps = fps == 0 ? inst : fps * 0.95 + inst * 0.05
+        }
+        lastFrameTime = now
+        if now - lastHUDTime > 0.25 {
+            lastHUDTime = now
+            onHUD?(hudText())
+        }
     }
 
-    func requestCapture() { captureRequested = true }
+    private func hudText() -> String {
+        let t = world.tun
+        let k = gParticleCount >= 1000 ? "\(gParticleCount / 1000)k" : "\(gParticleCount)"
+        let flags = [
+            world.bloomEnabled   ? "bloom" : nil,
+            world.showFieldLines ? "lines" : nil,
+            world.showAxes       ? "axes"  : nil,
+            world.autoRotate     ? "spin"  : nil,
+            world.paused         ? "PAUSED" : nil
+        ].compactMap { $0 }.joined(separator: " · ")
+        func f(_ v: Float, _ digits: Int = 2) -> String { String(format: "%.\(digits)f", v) }
+        let mode = kColorModeNames[Int(t.colorMode) % kColorModeNames.count]
+        return "[\(world.scenarioIndex + 1)/\(Scenarios.count)] \(world.scenario.name)"
+             + "   \(k) particles   \(Int(fps.rounded())) fps\n"
+             + "color \(mode) (C)   exposure \(f(t.exposure)) (-/=)   trail \(f(t.fade, 3)) (,/.)"
+             + "   size \(f(t.pointSize, 1)) (;/')   time \(f(t.timeScale))x (S)\n"
+             + flags
+    }
 
-    // ---- PNG capture (composite into an offscreen bgra8 target, current size) ----
-    private func capture(vp: float4x4) {
-        let W = max(1, pxW), H = max(1, pxH)
+    func requestCapture(scale: Int = 1) {
+        captureScale = max(1, min(4, scale))
+        captureRequested = true
+    }
+
+    // ---- PNG capture (composite into an offscreen bgra8 target) ----
+    // scale > 1 re-composites the HDR layers into a larger target (upsampled
+    // trails, but crisp tone mapping / gradient) — handy for wallpapers.
+    private func capture(vp: float4x4, scale: Int = 1) {
+        let W = max(1, pxW * scale), H = max(1, pxH * scale)
         let cd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: drawableFormat, width: W, height: H, mipmapped: false)
         cd.usage = [.renderTarget, .shaderRead]; cd.storageMode = .private
@@ -1068,6 +1223,9 @@ final class DemoView: MTKView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    var onCaptureHiRes: (() -> Void)?
+    var onHUDToggle: (() -> Void)?
+
     override func keyDown(with event: NSEvent) {
         guard let w = world else { return }
         switch event.charactersIgnoringModifiers ?? "" {
@@ -1077,16 +1235,30 @@ final class DemoView: MTKView {
         case "4": switchTo(3)
         case "5": switchTo(4)
         case "6": switchTo(5)
+        case "7": switchTo(6)
+        case "8": switchTo(7)
         case " ": w.paused.toggle()
         case "r", "R": onReseed?()
         case "f", "F": w.showFieldLines.toggle()
+        case "x", "X": w.showAxes.toggle()
         case "b", "B": w.bloomEnabled.toggle()
         case "a", "A": w.autoRotate.toggle()
+        case "h", "H": w.hudVisible.toggle(); onHUDToggle?()
+        case "c", "C": w.tun.colorMode = (w.tun.colorMode + 1) % 3
+        case "s", "S": w.tun.timeScale = (w.tun.timeScale < 1.0) ? 1.0 : 0.25
+        case "-": w.tun.exposure  = max(0.1, w.tun.exposure - 0.1)
+        case "=": w.tun.exposure  = min(6.0, w.tun.exposure + 0.1)
+        case ",": w.tun.fade      = max(0.0, w.tun.fade - 0.01)
+        case ".": w.tun.fade      = min(0.995, w.tun.fade + 0.01)
+        case ";": w.tun.pointSize = max(1.0, w.tun.pointSize - 0.5)
+        case "'": w.tun.pointSize = min(12.0, w.tun.pointSize + 0.5)
+        case "0": w.tun = Tunables()
         case "[":
             gParticleCount = max(10_000, gParticleCount / 2); onReseed?(); updateTitle()
         case "]":
             gParticleCount = min(kMaxParticles, gParticleCount * 2); onReseed?(); updateTitle()
         case "p", "P": onCapture?()
+        case "o", "O": onCaptureHiRes?()
         default: break
         }
     }
@@ -1111,8 +1283,8 @@ final class DemoView: MTKView {
 
     func updateTitle() {
         let k = gParticleCount >= 1000 ? "\(gParticleCount/1000)k" : "\(gParticleCount)"
-        window?.title = "EM Field Demo  —  [\(world?.scenario.name ?? "")]  ·  \(k) particles   "
-            + "(1-6 · Space · R reseed · F lines · B bloom · A spin · [ ] count · P png)"
+        window?.title = "EM Field Demo  —  [\(world?.scenario.name ?? "")]  ·  \(k) particles"
+            + "   (1-8 · H help/HUD · P png)"
     }
 }
 
@@ -1121,6 +1293,7 @@ final class DemoView: MTKView {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var renderer: Renderer!
+    var hud: NSTextField!
     let world = World()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1144,7 +1317,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.delegate = r
         view.onScenarioChange = { [weak r] in r?.seedParticles(); r?.refreshLineBuffers() }
         view.onReseed         = { [weak r] in r?.seedParticles() }
-        view.onCapture        = { [weak r] in r?.requestCapture() }
+        view.onCapture        = { [weak r] in r?.requestCapture(scale: 1) }
+        view.onCaptureHiRes   = { [weak r] in r?.requestCapture(scale: 2) }
+
+        // HUD overlay (top-left), refreshed ~4x per second from the render loop
+        hud = NSTextField(labelWithString: "")
+        hud.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        hud.textColor = NSColor(white: 0.88, alpha: 0.95)
+        hud.backgroundColor = NSColor(white: 0, alpha: 0.35)
+        hud.drawsBackground = true
+        hud.usesSingleLineMode = false
+        hud.maximumNumberOfLines = 0
+        hud.lineBreakMode = .byClipping
+        hud.autoresizingMask = [.minYMargin]     // stick to the top on resize
+        view.addSubview(hud)
+
+        view.onHUDToggle = { [weak self] in self?.hud.isHidden = !(self?.world.hudVisible ?? true) }
+        r.onHUD = { [weak self] text in
+            guard let self, self.world.hudVisible else { return }
+            self.hud.stringValue = text
+            self.hud.sizeToFit()
+            let pad: CGFloat = 10
+            let b = self.window.contentView?.bounds ?? .zero
+            self.hud.setFrameOrigin(NSPoint(x: pad, y: b.height - self.hud.frame.height - pad))
+        }
 
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
